@@ -62,3 +62,22 @@ body {
   color: hsl(var(--foreground));
   font-family: "Manrope", "Inter", "SF Pro Display", system-ui, sans-serif;
 }
+
+@keyframes savedClassPulse {
+  0% {
+    background-color: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.5);
+  }
+  50% {
+    background-color: rgba(16, 185, 129, 0.28);
+    border-color: rgba(16, 185, 129, 0.9);
+  }
+  100% {
+    background-color: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.5);
+  }
+}
+
+.saved-class-pulse {
+  animation: savedClassPulse 0.9s ease-in-out;
+}

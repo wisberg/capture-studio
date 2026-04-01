@@ -7,6 +7,7 @@ import {
   Loader2,
   Moon,
   Pencil,
+  Search,
   Sun,
   Check,
   X,
@@ -83,12 +84,38 @@ function App() {
   const [displayPercent, setDisplayPercent] = useState(0);
   const previewUrlsRef = useRef([]);
   const progressRafRef = useRef(null);
+  const progressLastTsRef = useRef(null);
   const displayPercentRef = useRef(0);
   const targetPercentRef = useRef(0);
   const [detachSelectorsInput, setDetachSelectorsInput] = useState("");
   const [detachSelectors, setDetachSelectors] = useState([]);
   const [previewItems, setPreviewItems] = useState([]);
   const [previewIndex, setPreviewIndex] = useState(0);
+  const [showAuth, setShowAuth] = useState(false);
+  const [authMode, setAuthMode] = useState("auto");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [examineUrl, setExamineUrl] = useState("");
+  const [examineActiveUrl, setExamineActiveUrl] = useState("");
+  const [examineMode, setExamineMode] = useState("idle");
+  const [examineMessage, setExamineMessage] = useState("");
+  const [useProxy, setUseProxy] = useState(true);
+  const [hoverInfo, setHoverInfo] = useState(null);
+  const [savedClasses, setSavedClasses] = useState([]);
+  const [lastSavedLabel, setLastSavedLabel] = useState(null);
+  const savePulseRef = useRef(null);
+  const [examinePresetId, setExaminePresetId] = useState("desktop");
+  const [examineCustomWidth, setExamineCustomWidth] = useState("");
+  const [examineCustomHeight, setExamineCustomHeight] = useState("");
+  const [examineViewport, setExamineViewport] = useState({
+    width: 1280,
+    height: 720,
+  });
+  const iframeRef = useRef(null);
+  const examineContainerRef = useRef(null);
+  const hoverTargetRef = useRef(null);
+  const hoverRafRef = useRef(null);
+  const cleanupInspectRef = useRef(null);
 
   const progressPercent = useMemo(() => {
     if (!status.total) return 0;
@@ -196,7 +223,15 @@ function App() {
   }, [progressPercent]);
 
   useEffect(() => {
-    const animate = () => {
+    const animate = (timestamp) => {
+      if (!progressLastTsRef.current) {
+        progressLastTsRef.current = timestamp;
+      }
+      const deltaMs = Math.min(
+        100,
+        timestamp - progressLastTsRef.current,
+      );
+      progressLastTsRef.current = timestamp;
       const current = displayPercentRef.current;
       const target = targetPercentRef.current;
       const diff = target - current;
@@ -204,7 +239,9 @@ function App() {
         displayPercentRef.current = target;
         setDisplayPercent(target);
       } else {
-        const step = Math.sign(diff) * Math.min(Math.abs(diff) * 0.08, 0.35);
+        const ratePerSecond = 8;
+        const maxStep = (ratePerSecond * deltaMs) / 1000;
+        const step = Math.sign(diff) * Math.min(Math.abs(diff), maxStep);
         const next = current + step;
         displayPercentRef.current = next;
         setDisplayPercent(next);
@@ -218,7 +255,30 @@ function App() {
         cancelAnimationFrame(progressRafRef.current);
         progressRafRef.current = null;
       }
+      progressLastTsRef.current = null;
     };
+  }, []);
+
+  useEffect(() => {
+    clearInspectListeners();
+    setHoverInfo(null);
+    return () => {
+      clearInspectListeners();
+      if (hoverRafRef.current) {
+        cancelAnimationFrame(hoverRafRef.current);
+        hoverRafRef.current = null;
+      }
+    };
+  }, [examineActiveUrl, useProxy, view]);
+
+  useEffect(() => {
+    const handleMessage = (event) => {
+      if (!event?.data || event.data.type !== "cs-examine-class") return;
+      const { classes, label } = event.data;
+      saveClassesFromMessage(classes, label);
+    };
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
   }, []);
 
   function toggleTheme() {
@@ -248,9 +308,27 @@ function App() {
         );
   }, [selectedDeviceIds]);
 
+  const examinePresets = useMemo(() => {
+    return DEVICE_PRESETS.map((device) => ({
+      id: device.id,
+      label: device.label,
+      width: device.width,
+      height: device.height,
+    }));
+  }, []);
+
   const allDevices = useMemo(() => {
     return [...selectedDevices, ...customSizes];
   }, [selectedDevices, customSizes]);
+
+  const authPayload = useMemo(() => {
+    if (!authUsername.trim() || !authPassword) return null;
+    return {
+      username: authUsername.trim(),
+      password: authPassword,
+      mode: authMode,
+    };
+  }, [authUsername, authPassword, authMode]);
 
   function parseDetachSelectors(value) {
     return value
@@ -329,6 +407,207 @@ function App() {
     setCustomSizes((prev) => prev.filter((item) => item.id !== id));
   }
 
+  function normalizeInputUrl(value) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return "";
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      return trimmed;
+    }
+    return `https://${trimmed}`;
+  }
+
+  function clearInspectListeners() {
+    if (cleanupInspectRef.current) {
+      cleanupInspectRef.current();
+      cleanupInspectRef.current = null;
+    }
+  }
+
+  function injectInspectScript(doc) {
+    if (!doc || doc.getElementById("cs-hover-overlay")) return;
+    const script = doc.createElement("script");
+    script.textContent = `
+      (() => {
+        if (document.getElementById("cs-hover-overlay")) return;
+        const overlay = document.createElement("div");
+        overlay.id = "cs-hover-overlay";
+        overlay.style.position = "fixed";
+        overlay.style.border = "2px solid rgba(16,185,129,0.9)";
+        overlay.style.background = "rgba(16,185,129,0.08)";
+        overlay.style.pointerEvents = "none";
+        overlay.style.zIndex = "2147483647";
+        overlay.style.display = "none";
+
+        const label = document.createElement("div");
+        label.id = "cs-hover-label";
+        label.style.position = "fixed";
+        label.style.background = "rgba(0,0,0,0.8)";
+        label.style.color = "#fff";
+        label.style.fontSize = "10px";
+        label.style.fontWeight = "600";
+        label.style.padding = "4px 8px";
+        label.style.borderRadius = "999px";
+        label.style.pointerEvents = "none";
+        label.style.zIndex = "2147483647";
+        label.style.display = "none";
+
+        document.addEventListener("DOMContentLoaded", () => {
+          document.body.appendChild(overlay);
+          document.body.appendChild(label);
+        });
+
+        const describe = (el) => {
+          if (!el) return "(no class)";
+          const classes = el.classList ? Array.from(el.classList) : [];
+          return classes.length ? "." + classes.join(" .") : "(no class)";
+        };
+
+        const update = (target) => {
+          if (!target || target === overlay || target === label) return;
+          const rect = target.getBoundingClientRect();
+          overlay.style.display = "block";
+          label.style.display = "block";
+          overlay.style.top = rect.top + "px";
+          overlay.style.left = rect.left + "px";
+          overlay.style.width = rect.width + "px";
+          overlay.style.height = rect.height + "px";
+          label.textContent = describe(target);
+          label.style.top = Math.max(0, rect.top - 22) + "px";
+          label.style.left = Math.max(0, rect.left) + "px";
+        };
+
+        document.addEventListener("mousemove", (event) => update(event.target));
+      document.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const target = event.target;
+        if (!target) return;
+        const classes = target.classList ? Array.from(target.classList) : [];
+        const payload = {
+          type: "cs-examine-class",
+          classes,
+          label: classes.length ? "." + classes.join(" .") : "(no class)",
+        };
+        window.parent?.postMessage(payload, "*");
+      });
+        document.addEventListener("mouseleave", () => {
+          overlay.style.display = "none";
+          label.style.display = "none";
+        });
+      })();
+    `;
+    doc.documentElement.appendChild(script);
+    cleanupInspectRef.current = () => {
+      script.remove();
+    };
+  }
+
+  function startExamine(nextUseProxy = true) {
+    const normalized = normalizeInputUrl(examineUrl || examineActiveUrl);
+    if (!normalized) {
+      setExamineMessage("Enter a valid URL to examine.");
+      return;
+    }
+    setUseProxy(nextUseProxy);
+    setExamineActiveUrl(normalized);
+    setExamineMode("loading");
+    setExamineMessage("");
+    setHoverInfo(null);
+  }
+
+  function saveClassesFromMessage(classes, label) {
+    if (!classes || !Array.isArray(classes)) return;
+    const clean = classes.filter(Boolean);
+    if (!clean.length) return;
+    const display = label || `.${clean.join(" .")}`;
+    setSavedClasses((prev) => {
+      const exists = prev.some((entry) => entry.label === display);
+      if (exists) return prev;
+      return [{ label: display, classes: clean }, ...prev].slice(0, 50);
+    });
+    setLastSavedLabel(display);
+    if (savePulseRef.current) {
+      clearTimeout(savePulseRef.current);
+    }
+    savePulseRef.current = setTimeout(() => {
+      setLastSavedLabel(null);
+      savePulseRef.current = null;
+    }, 1200);
+  }
+
+  function addSavedToDetach(entry) {
+    if (!entry?.classes?.length) return;
+    const selector = entry.classes.map((name) => `.${name}`).join("");
+    if (!selector) return;
+    setDetachSelectors((prev) => {
+      if (prev.includes(selector)) return prev;
+      return [...prev, selector];
+    });
+  }
+
+  function addAllSavedToDetach() {
+    if (!savedClasses.length) return;
+    setDetachSelectors((prev) => {
+      const next = [...prev];
+      savedClasses.forEach((entry) => {
+        const selector = entry.classes?.map((name) => `.${name}`).join("");
+        if (!selector) return;
+        if (!next.includes(selector)) next.push(selector);
+      });
+      return next;
+    });
+    const nextUrl = normalizeInputUrl(examineActiveUrl || examineUrl);
+    if (nextUrl) {
+      setUrl(nextUrl);
+    }
+    setView("capture");
+    setAdvancedOpen(true);
+    setTimeout(() => setAdvancedOpen(true), 0);
+  }
+
+  function applyExaminePreset(presetId) {
+    const preset = examinePresets.find((item) => item.id === presetId);
+    if (!preset) return;
+    setExamineViewport({ width: preset.width, height: preset.height });
+  }
+
+  function applyCustomExamineSize() {
+    const width = Number.parseInt(examineCustomWidth, 10);
+    const height = Number.parseInt(examineCustomHeight, 10);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return;
+    setExamineViewport({
+      width: Math.min(Math.max(width, 240), 4000),
+      height: Math.min(Math.max(height, 320), 4000),
+    });
+  }
+
+  function handleIframeLoad() {
+    if (!examineActiveUrl) return;
+    if (useProxy) {
+      setExamineMode("ready");
+      setExamineMessage("");
+      return;
+    }
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+    try {
+      const doc = iframe.contentDocument;
+      if (!doc) {
+        setExamineMode("blocked");
+        setExamineMessage("Unable to access iframe content.");
+        return;
+      }
+      injectInspectScript(doc);
+      setExamineMode("ready");
+      setExamineMessage("");
+    } catch {
+      setExamineMode("blocked");
+      setExamineMessage(
+        "This site blocks iframe inspection. Try the proxy option.",
+      );
+    }
+  }
+
   async function startExport() {
     setMessage("Preparing export...");
     setIsLoading(true);
@@ -362,6 +641,7 @@ function App() {
             devices: allDevices,
             hideSticky,
             detachSelectors,
+            auth: authPayload || undefined,
           },
         }),
       });
@@ -428,6 +708,21 @@ function App() {
         }
       });
 
+      eventSource.addEventListener("preview", async (event) => {
+        const data = JSON.parse(event.data || "{}");
+        const item = data.item;
+        const jobIdFromEvent = data.jobId || jobId;
+        if (!item || !jobIdFromEvent) return;
+        const hydrated = await hydratePreviewItem(jobIdFromEvent, item);
+        if (!hydrated) return;
+        setPreviews((prev) => {
+          const exists = prev.some((entry) => entry.id === hydrated.id);
+          if (exists) return prev;
+          return [...prev, hydrated];
+        });
+        setVisiblePreviewCount((count) => Math.max(count, 6));
+      });
+
       eventSource.addEventListener("error", () => {
         setMessage("Connection lost while waiting for progress updates.");
       });
@@ -454,7 +749,8 @@ function App() {
           options: {
             devices: allDevices,
             hideSticky,
-          detachSelectors,
+            detachSelectors,
+            auth: authPayload || undefined,
           },
         }),
     });
@@ -521,6 +817,30 @@ function App() {
     } catch (error) {
       setPreviewError(error.message);
       return [];
+    }
+  }
+
+  async function hydratePreviewItem(jobId, item) {
+    try {
+      const devices = [];
+      const createdUrls = [];
+      for (const device of item.devices || []) {
+        const previewUrl = `/api/export/preview/${jobId}/${encodeURIComponent(
+          device.previewName,
+        )}`;
+        const previewResponse = await fetch(previewUrl);
+        if (!previewResponse.ok) continue;
+        const blob = await previewResponse.blob();
+        const localUrl = URL.createObjectURL(blob);
+        createdUrls.push(localUrl);
+        devices.push({ ...device, blob, localUrl });
+      }
+      if (createdUrls.length) {
+        previewUrlsRef.current = [...previewUrlsRef.current, ...createdUrls];
+      }
+      return { ...item, devices };
+    } catch {
+      return null;
     }
   }
 
@@ -793,6 +1113,17 @@ function App() {
               <History className="h-4 w-4" />
               History
             </button>
+            <button
+              className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium transition hover:-translate-y-0.5 ${
+                view === "examine"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+              }`}
+              onClick={() => setView("examine")}
+            >
+              <Search className="h-4 w-4" />
+              Examine
+            </button>
           </div>
 
           <div
@@ -1015,7 +1346,7 @@ function App() {
               <div
                 className={`w-full max-w-5xl overflow-hidden transition-all duration-300 ${
                   advancedOpen
-                    ? "max-h-[720px] translate-y-0 opacity-100"
+                    ? "max-h-[1200px] translate-y-0 opacity-100"
                     : "pointer-events-none max-h-0 -translate-y-2 opacity-0"
                 }`}
               >
@@ -1156,15 +1487,17 @@ function App() {
                     <div className="flex items-center justify-between text-xs font-semibold text-muted-foreground">
                       <span>Hide sticky elements</span>
                       <button
-                        className={`flex h-5 w-10 items-center rounded-full transition ${
-                          hideSticky ? "bg-emerald-400" : "bg-muted"
+                        className={`flex h-5 w-10 items-center rounded-full border border-border/60 transition ${
+                          hideSticky ? "bg-emerald-400" : "bg-foreground/35"
                         }`}
                         onClick={() => setHideSticky((prev) => !prev)}
                         aria-label="Toggle sticky elements"
                       >
                         <span
-                          className={`h-4 w-4 rounded-full bg-white shadow transition ${
-                            hideSticky ? "translate-x-5" : "translate-x-1"
+                          className={`h-4 w-4 rounded-full shadow transition ${
+                            hideSticky
+                              ? "translate-x-5 bg-white"
+                              : "translate-x-1 bg-foreground/80"
                           }`}
                         />
                       </button>
@@ -1173,8 +1506,271 @@ function App() {
                       Applies to all selected devices.
                     </p>
                   </div>
+
+                  <div className="mt-5 rounded-xl border border-border bg-background/60 p-3">
+                    <div className="flex items-center justify-between text-xs font-semibold text-muted-foreground">
+                      <span>Staging auth</span>
+                      <button
+                        className={`flex h-5 w-10 items-center rounded-full border border-border/60 transition ${
+                          showAuth ? "bg-emerald-400" : "bg-foreground/35"
+                        }`}
+                        onClick={() => setShowAuth((prev) => !prev)}
+                        aria-label="Toggle staging auth"
+                      >
+                        <span
+                          className={`h-4 w-4 rounded-full shadow transition ${
+                            showAuth
+                              ? "translate-x-5 bg-white"
+                              : "translate-x-1 bg-foreground/80"
+                          }`}
+                        />
+                      </button>
+                    </div>
+                    <p className="mt-2 text-[10px] text-muted-foreground">
+                      Add credentials for staging sites. Stored only in memory.
+                    </p>
+                    {showAuth ? (
+                      <div className="mt-3 grid gap-2 sm:grid-cols-[140px_1fr]">
+                        <label className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                          Mode
+                        </label>
+                        <select
+                          className="h-9 rounded-xl border border-border bg-background px-3 text-xs text-foreground shadow-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                          value={authMode}
+                          onChange={(event) => setAuthMode(event.target.value)}
+                        >
+                          <option value="auto">Auto (basic or form)</option>
+                          <option value="basic">HTTP Basic</option>
+                          <option value="form">Login form</option>
+                        </select>
+                        <label className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                          Username
+                        </label>
+                        <input
+                          className="h-9 rounded-xl border border-border bg-background px-3 text-xs text-foreground shadow-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                          placeholder="staging username"
+                          value={authUsername}
+                          onChange={(event) => setAuthUsername(event.target.value)}
+                        />
+                        <label className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                          Password
+                        </label>
+                        <input
+                          className="h-9 rounded-xl border border-border bg-background px-3 text-xs text-foreground shadow-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                          type="password"
+                          placeholder="staging password"
+                          value={authPassword}
+                          onChange={(event) => setAuthPassword(event.target.value)}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </div>
+            </section>
+          )}
+
+          {view === "examine" && (
+            <section className="grid gap-6 transition-all duration-300">
+              <div className="rounded-3xl border border-border bg-card p-8 shadow-xl shadow-black/10">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold uppercase tracking-[0.3em] text-muted-foreground">
+                      Examine
+                    </p>
+                    <h2 className="text-2xl font-semibold">Inspect CSS classes</h2>
+                    <p className="text-sm text-muted-foreground">
+                      Hover elements to see their class names for exclusions.
+                    </p>
+                    {savedClasses.length ? (
+                      <div className="mt-4 flex flex-wrap items-center gap-2">
+                        {savedClasses.map((entry) => (
+                          <span
+                            key={entry.label}
+                            className={`inline-flex items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-[10px] font-semibold text-foreground ${
+                              entry.label === lastSavedLabel ? "saved-class-pulse" : ""
+                            }`}
+                          >
+                            {entry.label}
+                            <button
+                              className="text-foreground/70 transition hover:text-foreground"
+                              onClick={() =>
+                                setSavedClasses((prev) =>
+                                  prev.filter((item) => item.label !== entry.label),
+                                )
+                              }
+                              aria-label="Remove class"
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="mt-3 text-[10px] text-muted-foreground">
+                        Click an element in the iframe to save its class.
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 rounded-full border border-border bg-muted/60 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.8)]" />
+                    {examineMode === "loading" ? "Loading" : "Ready"}
+                  </div>
+                </div>
+
+                {savedClasses.length ? (
+                  <div className="mt-4 flex flex-wrap items-center gap-3">
+                    <button
+                      className="inline-flex items-center gap-2 rounded-xl bg-primary px-5 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/20 transition hover:opacity-90"
+                      onClick={addAllSavedToDetach}
+                    >
+                      Add to Advanced Options
+                    </button>
+                    <button
+                      className="rounded-full border border-border px-4 py-2 text-[10px] font-semibold text-muted-foreground transition hover:bg-muted/60 hover:text-foreground"
+                      onClick={() => setSavedClasses([])}
+                    >
+                      Clear saved classes
+                    </button>
+                  </div>
+                ) : null}
+
+                <div className="mt-6 grid gap-4 md:grid-cols-[1fr_auto]">
+                  <input
+                    className="h-12 rounded-xl border border-input bg-background px-4 text-sm text-foreground shadow-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                    placeholder="https://example.com"
+                    value={examineUrl}
+                    onChange={(event) => setExamineUrl(event.target.value)}
+                  />
+                  <div className="flex gap-2">
+                    <button
+                      className="inline-flex h-12 items-center justify-center gap-2 rounded-xl bg-primary px-5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/20 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                      onClick={() => startExamine(true)}
+                      disabled={examineMode === "loading"}
+                    >
+                      Load
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-3 md:grid-cols-[1fr_auto]">
+                  <div className="grid gap-2 sm:grid-cols-[160px_1fr]">
+                    <label className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                      Viewport preset
+                    </label>
+                    <select
+                      className="h-10 rounded-xl border border-border bg-background px-3 text-xs text-foreground shadow-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                      value={examinePresetId}
+                      onChange={(event) => {
+                        const next = event.target.value;
+                        setExaminePresetId(next);
+                        applyExaminePreset(next);
+                      }}
+                    >
+                      {examinePresets.map((preset) => (
+                        <option key={preset.id} value={preset.id}>
+                          {preset.label} ({preset.width}×{preset.height})
+                        </option>
+                      ))}
+                    </select>
+                    <label className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+                      Custom size
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                      <input
+                        className="h-10 w-24 rounded-xl border border-border bg-background px-3 text-xs text-foreground shadow-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                        placeholder="Width"
+                        value={examineCustomWidth}
+                        onChange={(event) => setExamineCustomWidth(event.target.value)}
+                      />
+                      <input
+                        className="h-10 w-24 rounded-xl border border-border bg-background px-3 text-xs text-foreground shadow-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
+                        placeholder="Height"
+                        value={examineCustomHeight}
+                        onChange={(event) => setExamineCustomHeight(event.target.value)}
+                      />
+                      <button
+                        className="h-10 rounded-xl border border-border px-3 text-xs font-semibold text-muted-foreground transition hover:bg-muted/60 hover:text-foreground"
+                        onClick={applyCustomExamineSize}
+                      >
+                        Apply
+                      </button>
+                    </div>
+                  </div>
+                  <div className="rounded-full bg-muted/40 px-3 py-2 text-[10px] text-muted-foreground">
+                    Current: {examineViewport.width}×{examineViewport.height}
+                  </div>
+                </div>
+
+                {useProxy ? (
+                  <p className="mt-3 text-[10px] text-muted-foreground">
+                    Proxy mode is active. Some sites may still block assets.
+                  </p>
+                ) : null}
+
+                {examineMessage ? (
+                  <p className="mt-4 text-sm text-red-400">{examineMessage}</p>
+                ) : null}
+              </div>
+
+              <div
+                ref={examineContainerRef}
+                className="relative h-[70vh] overflow-hidden rounded-3xl border border-border bg-card shadow-xl shadow-black/10"
+              >
+                {examineActiveUrl ? (
+                  <div className="flex h-full w-full items-center justify-center overflow-auto">
+                    <iframe
+                      ref={iframeRef}
+                      title="Examine preview"
+                      src={
+                        useProxy
+                          ? `/api/examine?url=${encodeURIComponent(examineActiveUrl)}`
+                          : examineActiveUrl
+                      }
+                      onLoad={handleIframeLoad}
+                      className="rounded-3xl border border-border bg-white shadow-lg"
+                      style={{
+                        width: `${examineViewport.width}px`,
+                        height: `${examineViewport.height}px`,
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                    Enter a URL to begin examining a page.
+                  </div>
+                )}
+
+                {examineMode === "blocked" ? (
+                  <div className="absolute inset-x-6 bottom-6 rounded-2xl border border-red-400/30 bg-red-400/10 p-4 text-xs text-red-200">
+                    Hover inspection is blocked by this site. Try “Load via proxy.”
+                  </div>
+                ) : null}
+
+                {hoverInfo ? (
+                  <>
+                    <div
+                      className="pointer-events-none absolute rounded-md border-2 border-emerald-400/90 bg-emerald-400/10"
+                      style={{
+                        top: `${Math.max(0, hoverInfo.top)}px`,
+                        left: `${Math.max(0, hoverInfo.left)}px`,
+                        width: `${Math.max(0, hoverInfo.width)}px`,
+                        height: `${Math.max(0, hoverInfo.height)}px`,
+                      }}
+                    />
+                    <div
+                      className="pointer-events-none absolute rounded-full bg-black/80 px-2 py-1 text-[10px] font-semibold text-white"
+                      style={{
+                        top: `${Math.max(0, hoverInfo.top - 22)}px`,
+                        left: `${Math.max(0, hoverInfo.left)}px`,
+                      }}
+                    >
+                      {hoverInfo.label}
+                    </div>
+                  </>
+                ) : null}
+              </div>
+
             </section>
           )}
 

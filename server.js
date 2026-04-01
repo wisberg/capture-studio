@@ -496,12 +496,206 @@ function normalizeDevices(devices) {
   return normalized.length ? normalized : defaults;
 }
 
-async function exportSite(normalizedUrl, options = {}, onProgress) {
+function normalizeAuth(auth) {
+  if (!auth || typeof auth !== "object") return null;
+  const username = String(auth.username || "").trim();
+  const password = String(auth.password || "").trim();
+  if (!username || !password) return null;
+  const mode =
+    auth.mode === "basic" || auth.mode === "form" ? auth.mode : "auto";
+  return { username, password, mode };
+}
+
+function injectExamineHtml(html, baseUrl) {
+  const safeBase = String(baseUrl || "").replace(/"/g, "&quot;");
+  const script = `
+    (() => {
+      const overlay = document.createElement("div");
+      overlay.id = "cs-hover-overlay";
+      overlay.style.position = "fixed";
+      overlay.style.border = "2px solid rgba(16,185,129,0.9)";
+      overlay.style.background = "rgba(16,185,129,0.08)";
+      overlay.style.pointerEvents = "none";
+      overlay.style.zIndex = "2147483647";
+      overlay.style.display = "none";
+
+      const label = document.createElement("div");
+      label.id = "cs-hover-label";
+      label.style.position = "fixed";
+      label.style.background = "rgba(0,0,0,0.8)";
+      label.style.color = "#fff";
+      label.style.fontSize = "10px";
+      label.style.fontWeight = "600";
+      label.style.padding = "4px 8px";
+      label.style.borderRadius = "999px";
+      label.style.pointerEvents = "none";
+      label.style.zIndex = "2147483647";
+      label.style.display = "none";
+
+      document.addEventListener("DOMContentLoaded", () => {
+        document.body.appendChild(overlay);
+        document.body.appendChild(label);
+      });
+
+      const describe = (el) => {
+        if (!el) return "(no class)";
+        const classes = el.classList ? Array.from(el.classList) : [];
+        return classes.length ? "." + classes.join(" .") : "(no class)";
+      };
+
+      const update = (target) => {
+        if (!target || target === overlay || target === label) return;
+        const rect = target.getBoundingClientRect();
+        overlay.style.display = "block";
+        label.style.display = "block";
+        overlay.style.top = rect.top + "px";
+        overlay.style.left = rect.left + "px";
+        overlay.style.width = rect.width + "px";
+        overlay.style.height = rect.height + "px";
+        label.textContent = describe(target);
+        label.style.top = Math.max(0, rect.top - 22) + "px";
+        label.style.left = Math.max(0, rect.left) + "px";
+      };
+
+      document.addEventListener("mousemove", (event) => update(event.target));
+      document.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const target = event.target;
+        if (!target) return;
+        const classes = target.classList ? Array.from(target.classList) : [];
+        const payload = {
+          type: "cs-examine-class",
+          classes,
+          label: classes.length ? "." + classes.join(" .") : "(no class)",
+        };
+        window.parent?.postMessage(payload, "*");
+      });
+      document.addEventListener("mouseleave", () => {
+        overlay.style.display = "none";
+        label.style.display = "none";
+      });
+    })();
+  `;
+
+  const scriptTag = `<script>${script}</script>`;
+  const baseTag = `<base href="${safeBase}">`;
+  const sanitized = html.replace(
+    /<meta[^>]+http-equiv=["']content-security-policy["'][^>]*>/gi,
+    "",
+  );
+
+  if (/<head[^>]*>/i.test(sanitized)) {
+    return sanitized.replace(
+      /<head[^>]*>/i,
+      (match) => `${match}\n${baseTag}\n${scriptTag}`,
+    );
+  }
+
+  if (/<html[^>]*>/i.test(sanitized)) {
+    return sanitized.replace(
+      /<html[^>]*>/i,
+      (match) => `${match}\n<head>${baseTag}${scriptTag}</head>`,
+    );
+  }
+
+  return `<!doctype html><html><head>${baseTag}${scriptTag}</head><body>${sanitized}</body></html>`;
+}
+
+async function hasVisiblePasswordField(page) {
+  const locator = page.locator('input[type="password"]');
+  if ((await locator.count()) === 0) return false;
+  return locator.first().isVisible().catch(() => false);
+}
+
+async function attemptFormLogin(page, auth) {
+  const passwordInput = page.locator('input[type="password"]').first();
+  if ((await passwordInput.count()) === 0) return false;
+  const isVisible = await passwordInput.isVisible().catch(() => false);
+  if (!isVisible) return false;
+
+  const form = passwordInput.locator("xpath=ancestor::form[1]");
+  const scope = (await form.count()) > 0 ? form : page.locator("body");
+  const usernameInputCandidates = [
+    'input[type="email"]',
+    'input[name*="email" i]',
+    'input[name*="user" i]',
+    'input[id*="user" i]',
+    'input[name*="login" i]',
+    'input[type="text"]',
+  ];
+
+  for (const selector of usernameInputCandidates) {
+    const candidate = scope.locator(selector).first();
+    if ((await candidate.count()) === 0) continue;
+    const visible = await candidate.isVisible().catch(() => false);
+    if (!visible) continue;
+    await candidate.fill(auth.username).catch(() => {});
+    break;
+  }
+
+  await passwordInput.fill(auth.password).catch(() => {});
+
+  const submitCandidates = [
+    'button[type="submit"]',
+    'input[type="submit"]',
+    'button:has-text("Sign in")',
+    'button:has-text("Log in")',
+    'button:has-text("Login")',
+  ];
+
+  let submitted = false;
+  for (const selector of submitCandidates) {
+    const candidate = scope.locator(selector).first();
+    if ((await candidate.count()) === 0) continue;
+    const visible = await candidate.isVisible().catch(() => false);
+    if (!visible) continue;
+    await candidate.click({ timeout: 1500 }).catch(() => {});
+    submitted = true;
+    break;
+  }
+
+  if (!submitted) {
+    await passwordInput.press("Enter").catch(() => {});
+  }
+
+  await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  return true;
+}
+
+async function ensureAuthenticated(page, targetUrl, auth) {
+  if (!auth) return;
+
+  const response = await page.goto(targetUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60_000,
+  });
+  await page.waitForLoadState("networkidle", { timeout: 60_000 }).catch(() => {});
+
+  if (auth.mode === "basic") {
+    if (response?.status() === 401) {
+      throw new Error("Authentication failed (HTTP 401). Check credentials.");
+    }
+    return;
+  }
+
+  const needsFormLogin = await hasVisiblePasswordField(page);
+  if (needsFormLogin || auth.mode === "form") {
+    await attemptFormLogin(page, auth);
+    if (await hasVisiblePasswordField(page)) {
+      throw new Error("Authentication failed. Please verify credentials.");
+    }
+  }
+}
+
+async function exportSite(normalizedUrl, options = {}, onProgress, onPreview) {
   const devices = normalizeDevices(options.devices);
   const hideSticky = options.hideSticky !== false;
   const detachSelectors = Array.isArray(options.detachSelectors)
     ? options.detachSelectors.filter(Boolean)
     : [];
+  const auth = normalizeAuth(options.auth);
   const sitemapUrl = normalizedUrl.endsWith(".xml")
     ? normalizedUrl
     : new URL("/sitemap.xml", normalizedUrl).toString();
@@ -538,8 +732,16 @@ async function exportSite(normalizedUrl, options = {}, onProgress) {
   let browser;
   try {
     browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext();
+    const context = await browser.newContext(
+      auth?.mode === "basic" || auth?.mode === "auto"
+        ? { httpCredentials: { username: auth.username, password: auth.password } }
+        : undefined,
+    );
     const page = await context.newPage();
+    const authTargetUrl = normalizedUrl.endsWith(".xml")
+      ? new URL("/", normalizedUrl).toString()
+      : normalizedUrl;
+    await ensureAuthenticated(page, authTargetUrl, auth);
     const usedNames = new Map();
     const previews = [];
 
@@ -600,7 +802,7 @@ async function exportSite(normalizedUrl, options = {}, onProgress) {
               );
               devicePreviews.push({
                 id: `${device.id}_detached_${detachedIndex}`,
-                label: `Detached ${detachedIndex}`,
+                label: `Detached ${device.label || device.id} ${detachedIndex}`,
                 slug: deviceSlug,
                 previewName: detachedName,
               });
@@ -609,13 +811,15 @@ async function exportSite(normalizedUrl, options = {}, onProgress) {
           }
         }
 
-        previews.push({
+        const previewEntry = {
           id: baseName,
           title: baseName,
           displayTitle: pageTitleRaw || baseName,
           pageUrl,
           devices: devicePreviews,
-        });
+        };
+        previews.push(previewEntry);
+        onPreview?.(previewEntry);
       } catch {
         // skip pages that fail
       } finally {
@@ -774,8 +978,17 @@ app.post("/api/export/start", async (req, res) => {
 
   try {
     updateJob(job, { stage: "starting", message: "Starting export…" });
-    const result = await exportSite(normalizedUrl, options || {}, (progress) =>
-      updateJob(job, progress),
+    const result = await exportSite(
+      normalizedUrl,
+      options || {},
+      (progress) => updateJob(job, progress),
+      (previewEntry) => {
+        job.previews = [...(job.previews || []), previewEntry];
+        sendEvent(job, "preview", {
+          item: previewEntry,
+          jobId,
+        });
+      },
     );
     job.archiveName = result.archiveName;
     job.archivePath = result.archivePath;
@@ -860,6 +1073,42 @@ app.post("/api/export", async (req, res) => {
         .rm(result.tempRoot, { recursive: true, force: true })
         .catch(() => {});
     }
+  }
+});
+
+app.get("/api/examine", async (req, res) => {
+  const rawUrl = req.query.url;
+  if (!rawUrl || typeof rawUrl !== "string") {
+    return res.status(400).json({ error: "A URL is required." });
+  }
+
+  let normalizedUrl;
+  try {
+    normalizedUrl = normalizeUrl(rawUrl);
+  } catch {
+    return res.status(400).json({ error: "Invalid URL." });
+  }
+
+  try {
+    const response = await fetch(normalizedUrl, { redirect: "follow" });
+    if (!response.ok) {
+      return res
+        .status(502)
+        .json({ error: `Failed to fetch: HTTP ${response.status}` });
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.includes("text/html")) {
+      return res.status(400).json({ error: "URL did not return HTML." });
+    }
+    const html = await response.text();
+    const baseUrl = response.url || normalizedUrl;
+    const injected = injectExamineHtml(html, baseUrl);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.send(injected);
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ error: error.message || "Failed to load URL." });
   }
 });
 
